@@ -1,0 +1,114 @@
+#!/bin/bash
+
+#
+# Usage
+#
+function usage {
+  cat <<EOM
+Usage: $(basename "$0") [optional flags] [command] args
+GLOBAL FLAGS
+    -h|--help    Display help
+
+COMMANDS
+    run          Create & Run Notebook on GCP
+    proxy        Create tunnel to Notebook
+    clean        Clean up Notebook and Filewall rule
+EOM
+
+  exit 2
+}
+
+#
+# Load config
+#
+[[ -z "${PRJ}" ]] && PRJ=$(cat ${HOME}/.gnote|grep PROJECT:|awk '{print $2}')
+[[ -z "${ZONE}" ]] && ZONE=$(cat ${HOME}/.gnote|grep ZONE:|awk '{print $2}')
+[[ -z "${IMAGE}" ]] && IMAGE=$(cat ${HOME}/.gnote|grep IMAGE:|awk '{print $2}')
+TMP_DIR=/tmp/gnote
+#
+# Define variable
+#
+CURL_OPTIONS=""
+
+OPTIONS=($(echo $@ | ruby -ne 'puts $_.split(" ").find_all{|s| s[0]=="-"}.join(" ")'))
+ARGS=($(echo $@    | ruby -ne 'puts $_.split(" ").find_all{|s| s[0]!="-"}.join(" ")'))
+
+#
+# If no arguments
+#
+if [ "$1" = "" ];then
+    usage
+fi
+
+#
+# Options
+#
+for opt in ${OPTIONS[@]}; do
+    case "$opt" in
+        '-h'|'--help' ) usage ;;
+    esac
+done
+
+#
+# Commands
+#
+SUBCMD=${ARGS[0]}
+case "${SUBCMD}" in
+    "run" ) 
+        INS_NAME=ins-notebook$(date +%s)
+
+        mkdir -p $TMP_DIR
+        echo $INS_NAME > $TMP_DIR/ins_id
+
+        # create instance
+        gcloud beta compute instances create-with-container \
+            $INS_NAME \
+            --project=${PRJ} \
+            --zone=${ZONE} \
+            --machine-type=e2-standard-2 \
+            --preemptible \
+            --subnet=default --no-address \
+            --tags=gnote \
+            --image-family=cos-stable \
+            --image-project=cos-cloud \
+            --container-image=docker.io/${IMAGE} \
+
+        # create firewall rule
+        gcloud compute firewall-rules create allow-iap-gnote \
+        --network=default \
+        --target-tags=gnote \
+        --allow=tcp:8888 \
+        --source-ranges=35.235.240.0/20 \
+        --project=${PRJ} 
+
+        # get login token for notebook
+        INS_ID=$(gcloud compute instances describe $(cat $TMP_DIR/ins_id) --zone=${ZONE} --project=${PRJ} --format json| jq .id)
+        URL=""
+        while [ "$URL" = "" ]
+        do
+            echo -n "."
+            URL=$(gcloud logging read 'resource.type=gce_instance AND
+                                resource.labels.instance_id='${INS_ID}' AND
+                                log_name=projects/'${PRJ}'/logs/cos_containers AND
+                                jsonPayload.message =~ ".*http://127.0.0.1:8888/\?token=.*"' --project=${PRJ} --format=json|jq .[].jsonPayload.message|head -n1|awk '{print $3}'|sed 's/\\.*//g')
+            sleep 5
+        done
+        echo "."
+        echo $URL
+
+        # Foward
+        gcloud compute start-iap-tunnel $(cat $TMP_DIR/ins_id) 8888 --local-host-port=localhost:8888 --zone=${ZONE} --project=${PRJ} 
+
+    ;;
+    "proxy" ) 
+       # Foward
+        gcloud compute start-iap-tunnel $(cat $TMP_DIR/ins_id) 8888 --local-host-port=localhost:8888 --zone=${ZONE} --project=${PRJ} 
+    ;;
+    "clean" ) 
+        gcloud compute instances delete $(cat $TMP_DIR/ins_id) --project=${PRJ} --zone=${ZONE}
+        gcloud compute firewall-rules delete allow-iap-gnote --project=${PRJ}
+    ;;
+    "help" ) 
+        usage
+    ;;
+esac
